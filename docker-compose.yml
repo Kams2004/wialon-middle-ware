@@ -1,0 +1,28 @@
+services:
+  middleware:
+    build: .
+    image: wialon-middleware:latest
+    container_name: wialon-middleware
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      BRIDGE_DB_PATH: /app/data/bridge.db
+    ports:
+      # only reachable from the VPS itself by default; set BIND_ADDRESS=0.0.0.0 in .env
+      # to expose it (then API_KEY must be set)
+      - "${BIND_ADDRESS:-127.0.0.1}:${HOST_PORT:-8000}:8000"
+    volumes:
+      - bridge-data:/app/data
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  bridge-data:

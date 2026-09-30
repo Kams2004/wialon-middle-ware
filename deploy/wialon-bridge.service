@@ -1,0 +1,18 @@
+# Install: sudo cp deploy/wialon-bridge.service /etc/systemd/system/
+#          sudo systemctl daemon-reload && sudo systemctl enable --now wialon-bridge
+# Logs:    journalctl -u wialon-bridge -f
+[Unit]
+Description=Jimi -> Wialon IPS bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=kamsu-perold
+WorkingDirectory=/home/kamsu-perold/wialon-ips-middleware
+# exactly one worker: the outbox and IPS connections must not be shared between processes
+ExecStart=/home/kamsu-perold/wialon-ips-middleware/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8000 --workers 1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
