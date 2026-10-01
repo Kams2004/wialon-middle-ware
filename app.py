@@ -5,6 +5,7 @@ Run:  uvicorn app:app --host 0.0.0.0 --port 8000
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import secrets
 from contextlib import asynccontextmanager
@@ -35,7 +36,13 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     api_key: str = ""                # when set, every endpoint except /health needs X-API-Key
 
-    # Jimi / TrackSolid Pro bridge (enabled when app key + account are set)
+    # Jimi / TrackSolid Pro bridge
+    #   webhook: Jimi pushes to POST /api/v1/tag/data/push (no Jimi API calls)
+    #   poll:    poll the Jimi Open API (needs JIMI_APP_KEY etc.)
+    #   off:     bridge disabled
+    jimi_mode: str = "webhook"
+    webhook_token: str = ""          # if set, Jimi's URL must carry it (see README)
+    webhook_max_body: int = 2_000_000
     jimi_base_url: str = "https://eu-open.tracksolidpro.com/route/rest"
     jimi_app_key: str = ""
     jimi_app_secret: str = ""
@@ -48,8 +55,8 @@ class Settings(BaseSettings):
     bridge_overlap_minutes: float = 120
 
     @property
-    def jimi_enabled(self) -> bool:
-        return bool(self.jimi_app_key and self.jimi_account)
+    def bridge_enabled(self) -> bool:
+        return self.jimi_mode in ("webhook", "poll")
 
 
 settings = Settings()
@@ -64,10 +71,14 @@ bridge: JimiBridge | None = None
 def _build_bridge() -> JimiBridge:
     Path(settings.bridge_db_path).parent.mkdir(parents=True, exist_ok=True)
     store = Store(settings.bridge_db_path)
-    jimi = JimiClient(
-        settings.jimi_app_key, settings.jimi_app_secret, settings.jimi_account,
-        settings.jimi_password_md5 or hashlib.md5(settings.jimi_password.encode()).hexdigest(),
-        base_url=settings.jimi_base_url, token_store=store)
+    jimi = None
+    if settings.jimi_mode == "poll":
+        if not (settings.jimi_app_key and settings.jimi_account):
+            raise RuntimeError("JIMI_MODE=poll needs JIMI_APP_KEY, JIMI_APP_SECRET, JIMI_ACCOUNT")
+        jimi = JimiClient(
+            settings.jimi_app_key, settings.jimi_app_secret, settings.jimi_account,
+            settings.jimi_password_md5 or hashlib.md5(settings.jimi_password.encode()).hexdigest(),
+            base_url=settings.jimi_base_url, token_store=store)
     return JimiBridge(jimi, gateway, store, BridgeConfig(
         poll_interval=settings.bridge_poll_interval,
         backfill_hours=settings.bridge_backfill_hours,
@@ -78,13 +89,15 @@ def _build_bridge() -> JimiBridge:
 async def lifespan(_: FastAPI):
     global bridge
     gateway.start()
-    if settings.jimi_enabled:
+    if settings.bridge_enabled:
         bridge = _build_bridge()
         bridge.start()
+        logging.getLogger(__name__).info("bridge started in %s mode", bridge.mode)
     yield
     if bridge:
         await bridge.stop()
-        await bridge.jimi.close()
+        if bridge.jimi:
+            await bridge.jimi.close()
         bridge.store.close()
     await gateway.stop()
     if api:
@@ -94,11 +107,14 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Wialon IPS middleware", lifespan=lifespan)
 
 OPEN_PATHS = {"/health", "/docs", "/openapi.json"}
+WEBHOOK_PATH = "/api/v1/tag/data/push"
 
 
 @app.middleware("http")
 async def require_api_key(request: Request, call_next):
-    if settings.api_key and request.url.path not in OPEN_PATHS:
+    # the Jimi webhook cannot send our API key; it has its own optional token
+    path = request.url.path.rstrip("/")
+    if settings.api_key and path not in OPEN_PATHS and not path.endswith(WEBHOOK_PATH):
         given = request.headers.get("x-api-key", "")
         if not secrets.compare_digest(given.encode(), settings.api_key.encode()):
             return JSONResponse({"detail": "missing or invalid X-API-Key"}, status_code=401)
@@ -157,18 +173,73 @@ async def devices():
             for d in gateway.devices.values()]
 
 
+# ---------- Jimi webhook ----------
+
+def _webhook_reply(code: int, msg: str) -> JSONResponse:
+    return JSONResponse({"code": code, "msg": msg}, status_code=code)
+
+
+def _records(payload) -> list | None:
+    """Jimi sends a JSON array; also accept {"data": [...]} or a single object."""
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("data", "list", "records"):
+            if isinstance(payload.get(key), list):
+                return payload[key]
+        if "imei" in payload:
+            return [payload]
+    return None
+
+
+@app.post(WEBHOOK_PATH)
+@app.post("/{token}" + WEBHOOK_PATH)
+async def jimi_tag_push(request: Request, token: str | None = None):
+    """Receiver for Jimi's Tag location push. Stores and answers at once (Jimi does not retry)."""
+    log = logging.getLogger("webhook")
+    if not bridge:
+        return _webhook_reply(503, "bridge disabled")
+    if settings.webhook_token:
+        given = token or request.query_params.get("token", "")
+        if not secrets.compare_digest(given.encode(), settings.webhook_token.encode()):
+            log.warning("push with missing/wrong token from %s", request.client.host if request.client else "?")
+            return _webhook_reply(401, "unauthorized")
+
+    body = await request.body()
+    if len(body) > settings.webhook_max_body:
+        log.error("push of %d bytes refused (limit %d)", len(body), settings.webhook_max_body)
+        return _webhook_reply(413, "payload too large")
+    try:
+        records = _records(json.loads(body))
+    except ValueError:
+        records = None
+    if records is None:
+        log.error("unreadable push from %s: %r", request.client.host if request.client else "?",
+                  body[:500])
+        return _webhook_reply(400, "invalid payload")
+    try:
+        bridge.ingest(records)
+    except Exception:
+        log.exception("could not store push (%d records)", len(records))
+        return _webhook_reply(500, "storage error")
+    return _webhook_reply(200, "success")
+
+
 # ---------- Jimi bridge ----------
 
 @app.get("/health")
 async def health():
     ok = True
     info: dict = {"bridge": "disabled"}
-    if bridge:
+    if bridge and bridge.mode == "webhook":
+        info = {"bridge": "running", "mode": "webhook",
+                "last_push_at": bridge.webhook["last_at"]}
+    elif bridge:
         stale = (bridge.last_poll_ok_at is None or
                  (datetime.now(timezone.utc) - bridge.last_poll_ok_at).total_seconds()
                  > 3 * settings.bridge_poll_interval + 60)
         ok = not (stale and bridge.last_poll_error)
-        info = {"bridge": "running", "last_poll_ok_at": bridge.last_poll_ok_at,
+        info = {"bridge": "running", "mode": "poll", "last_poll_ok_at": bridge.last_poll_ok_at,
                 "last_poll_error": bridge.last_poll_error}
     if not ok:
         raise HTTPException(503, info)
@@ -188,9 +259,18 @@ async def bridge_status():
 
 @app.post("/bridge/poll")
 async def bridge_poll():
-    """Poll Jimi now instead of waiting for the next cycle."""
-    _require_bridge().trigger_poll()
+    """Poll Jimi now instead of waiting for the next cycle (poll mode only)."""
+    b = _require_bridge()
+    if b.mode != "poll":
+        raise HTTPException(409, "bridge is in webhook mode; Jimi pushes data itself")
+    b.trigger_poll()
     return {"status": "poll triggered"}
+
+
+@app.get("/bridge/webhook/recent")
+async def bridge_recent_pushes():
+    """The last 20 pushes received from Jimi (counts, IMEIs, validation errors)."""
+    return list(_require_bridge().recent_pushes)
 
 
 @app.get("/bridge/errors/{imei}")

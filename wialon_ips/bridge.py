@@ -1,11 +1,18 @@
 """Jimi -> Wialon bridge.
 
-Two independent loops share the SQLite outbox:
+Positions enter the SQLite outbox in one of two ways:
 
-  poller  every `poll_interval`: one jimi.user.device.location.list call for all
-          devices; for each device whose latest gpsTime moved past its cursor,
-          fetch jimi.device.track.list since (cursor - overlap) so intermediate
-          points are not lost, and enqueue everything (duplicates are ignored).
+  webhook Jimi pushes Tag positions to POST /api/v1/tag/data/push; `ingest()`
+          validates them and stores them immediately. Jimi does not retry
+          failed pushes, so receiving never waits for Wialon.
+
+  poller  (only when JIMI_MODE=poll) every `poll_interval`: one
+          jimi.user.device.location.list call for all devices; for each device
+          whose latest gpsTime moved past its cursor, fetch jimi.device.track.list
+          since (cursor - overlap) so intermediate points are not lost, and
+          enqueue everything (duplicates are ignored).
+
+and a single sender loop delivers the outbox to Wialon:
 
   sender  drains pending messages per IMEI, oldest first, over Wialon IPS
           (#D# for one message, #B# black box for several). Failures are
@@ -19,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -32,6 +40,8 @@ log = logging.getLogger(__name__)
 
 POS_TYPES = {"1": "GPS", "2": "LBS", "3": "WIFI", "5": "BEACON"}
 MAX_TRACK_WINDOW = timedelta(days=7)
+MAX_AGE = timedelta(days=30)        # pushed points older than this are refused
+MAX_FUTURE = timedelta(days=1)      # ...and points this far in the future
 
 
 # ---------- Jimi record -> Position ----------
@@ -59,7 +69,11 @@ def to_position(rec: dict, latest: bool = False) -> Position | None:
     pos_type = rec.get("posType", rec.get("positionType"))
     if pos_type is not None:
         params["pos_type"] = POS_TYPES.get(str(pos_type), str(pos_type))
-    if (conf := _num(rec.get("confidence"))) is not None:
+    # Tags report their accuracy level (1-3) as "confidence", or as gpsNum in pushes
+    conf = _num(rec.get("confidence"))
+    if conf is None and pos_type is not None and str(pos_type) in ("5", "BEACON"):
+        conf = _num(rec.get("gpsNum"))
+    if conf is not None:
         params["confidence"] = int(conf)
     if (mode := rec.get("gpsMode")) is not None:
         params["gps_mode"] = int(mode)   # 0 real-time, 1 re-uploaded
@@ -87,6 +101,7 @@ class DeviceState:
     next_attempt: float = 0.0
     backoff: float = 0.0
     last_sent_at: datetime | None = None
+    last_received_at: datetime | None = None
 
 
 @dataclass
@@ -102,8 +117,9 @@ class BridgeConfig:
 
 
 class JimiBridge:
-    def __init__(self, jimi: JimiClient, gateway: IPSGateway, store: Store,
+    def __init__(self, jimi: JimiClient | None, gateway: IPSGateway, store: Store,
                  config: BridgeConfig | None = None):
+        """`jimi` is only needed for polling; pass None in webhook mode."""
         self.jimi, self.gateway, self.store = jimi, gateway, store
         self.cfg = config or BridgeConfig()
         self.devices: dict[str, DeviceState] = {}
@@ -115,9 +131,72 @@ class JimiBridge:
         self._wake = asyncio.Event()
         self._poll_now = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
+        self.webhook = {"requests": 0, "accepted": 0, "duplicates": 0, "invalid": 0,
+                        "last_at": None}
+        self.recent_pushes: deque[dict] = deque(maxlen=20)
+
+    @property
+    def mode(self) -> str:
+        return "poll" if self.jimi else "webhook"
 
     def _state(self, imei: str) -> DeviceState:
         return self.devices.setdefault(imei, DeviceState(imei))
+
+    # ---------- webhook ----------
+
+    def ingest(self, records: list) -> dict:
+        """Validate and store pushed records. Returns counts; never talks to Wialon."""
+        now = datetime.now(timezone.utc)
+        by_imei: dict[str, list[Position]] = {}
+        invalid: list[str] = []
+        for rec in records:
+            imei = str(rec.get("imei") or "").strip() if isinstance(rec, dict) else ""
+            if not (imei.isdigit() and 5 <= len(imei) <= 20):
+                invalid.append(f"bad imei {imei!r}")
+                continue
+            try:
+                pos = to_position(rec)
+            except (TypeError, ValueError, OverflowError, OSError) as e:
+                invalid.append(f"{imei}: {e}")
+                continue
+            if pos is None or not (-90 <= pos.lat <= 90 and -180 <= pos.lon <= 180):
+                invalid.append(f"{imei}: no valid position")
+                continue
+            if not (now - MAX_AGE <= pos.time <= now + MAX_FUTURE):
+                invalid.append(f"{imei}: time out of range {pos.time.isoformat()}")
+                continue
+            by_imei.setdefault(imei, []).append(pos)
+
+        accepted = 0
+        for imei, positions in by_imei.items():
+            accepted += self.store.enqueue(imei, positions)
+            st = self._state(imei)
+            st.last_received_at = now
+            latest = max(p.time for p in positions)
+            if st.last_gps_time is None or latest > st.last_gps_time:
+                st.last_gps_time = latest
+        valid = sum(len(v) for v in by_imei.values())
+        result = {"received": len(records), "accepted": accepted,
+                  "duplicates": valid - accepted, "invalid": len(invalid)}
+
+        self.webhook["requests"] += 1
+        self.webhook["last_at"] = now
+        for k in ("accepted", "duplicates", "invalid"):
+            self.webhook[k] += result[k]
+        self.recent_pushes.appendleft({"at": now, **result, "errors": invalid[:10],
+                                       "imeis": sorted(by_imei)[:50]})
+        if invalid:
+            log.warning("webhook: %d invalid record(s), e.g. %s", len(invalid), invalid[:3])
+        log.info("webhook: %d received, %d new, %d duplicate, %d invalid",
+                 result["received"], accepted, result["duplicates"], len(invalid))
+        if accepted:
+            self._wake.set()
+        return result
+
+    def housekeeping(self) -> None:
+        if time.time() - self._last_prune > 86400:
+            self.store.prune(self.cfg.keep_sent_days, self.cfg.max_pending_days)
+            self._last_prune = time.time()
 
     # ---------- polling ----------
 
@@ -138,9 +217,6 @@ class JimiBridge:
         self.last_poll_ok_at = datetime.now(timezone.utc)
         self.last_poll_error = None
 
-        if time.time() - self._last_prune > 86400:
-            self.store.prune(self.cfg.keep_sent_days, self.cfg.max_pending_days)
-            self._last_prune = time.time()
         if queued:
             self._wake.set()
         return queued
@@ -272,6 +348,7 @@ class JimiBridge:
     async def _send_loop(self) -> None:
         while True:
             try:
+                self.housekeeping()
                 await self.send_pending()
             except Exception:
                 log.exception("sender cycle failed")
@@ -284,8 +361,9 @@ class JimiBridge:
     # ---------- lifecycle / status ----------
 
     def start(self) -> None:
-        self._tasks = [asyncio.create_task(self._poll_loop(), name="jimi-poll"),
-                       asyncio.create_task(self._send_loop(), name="wialon-send")]
+        self._tasks = [asyncio.create_task(self._send_loop(), name="wialon-send")]
+        if self.jimi:
+            self._tasks.append(asyncio.create_task(self._poll_loop(), name="jimi-poll"))
 
     async def stop(self) -> None:
         for t in self._tasks:
@@ -297,6 +375,8 @@ class JimiBridge:
         counts = self.store.stats()
         imeis = sorted(set(self.devices) | set(counts))
         return {
+            "mode": self.mode,
+            "webhook": self.webhook,
             "last_poll_at": self.last_poll_at,
             "last_poll_ok_at": self.last_poll_ok_at,
             "last_poll_error": self.last_poll_error,
@@ -305,6 +385,7 @@ class JimiBridge:
                 "name": self._state(i).name,
                 "wialon_unit": self._state(i).unit,
                 "last_gps_time": self._state(i).last_gps_time,
+                "last_received_at": self._state(i).last_received_at,
                 "last_sent_at": self._state(i).last_sent_at,
                 "messages": counts.get(i, {}),
                 "last_error": self._state(i).last_error,

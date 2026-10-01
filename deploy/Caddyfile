@@ -1,0 +1,23 @@
+# Public entry point. Only the Jimi webhook and /health are reachable from the
+# internet; every other endpoint stays private on the VPS (127.0.0.1:8000).
+#   SITE_ADDRESS=:80              -> plain HTTP on the server IP
+#   SITE_ADDRESS=tags.example.com -> automatic HTTPS (Let's Encrypt), needs DNS -> VPS
+{$SITE_ADDRESS} {
+	@webhook path_regexp ^/([A-Za-z0-9_-]+/)?api/v1/tag/data/push/?$
+	handle @webhook {
+		request_body {
+			max_size 2MB
+		}
+		reverse_proxy middleware:8000
+	}
+	handle /health {
+		reverse_proxy middleware:8000
+	}
+	handle {
+		respond 404
+	}
+	log {
+		output stdout
+		format console
+	}
+}

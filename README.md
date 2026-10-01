@@ -2,7 +2,7 @@
 
 Pushes positions into Wialon over the **Wialon IPS 2.0** TCP protocol, from two sources:
 
-1. **Jimi / TrackSolid Pro bridge**: polls the Jimi Open API for Tag locations and forwards them automatically.
+1. **Jimi / TrackSolid Pro Tags**: Jimi **pushes** Tag locations to our webhook (default), or we poll their Open API.
 2. **HTTP API**: your own systems `POST /positions`.
 
 Receives positions over HTTP and pushes them to Wialon using the **Wialon IPS 2.0** TCP protocol.
@@ -42,7 +42,9 @@ cp .env.example .env && nano .env   # fill in credentials + API_KEY (openssl ran
 |---|---|
 | `./scripts/status.sh` | Container state, Jimi poll health, one line per Tag |
 | `docker compose logs -f --tail 100` | Live logs |
-| `./scripts/poll-now.sh` | Poll Jimi immediately |
+| `./scripts/pushes.sh` | The last 20 pushes received from Jimi (counts, IMEIs, invalid records) |
+| `./scripts/webhook-url.sh` | The URL to give Jimi |
+| `./scripts/poll-now.sh` | Poll Jimi immediately (poll mode only) |
 | `./scripts/backup-db.sh` | Copy the outbox database to `backups/` |
 | `docker compose restart` / `docker compose down` | Restart / stop (data is kept in the `bridge-data` volume) |
 
@@ -98,7 +100,34 @@ Quick test without the HTTP layer: `.venv/bin/python send_position.py <imei> [la
 - Failed sends are buffered per IMEI and flushed as a `#B#` black-box packet on reconnect.
   The buffer is in memory, so it is lost on restart.
 
-## Jimi → Wialon bridge
+## Jimi Tag webhook (default: `JIMI_MODE=webhook`)
+
+Jimi pushes Tag positions to us (spec: <https://tracksolidprodocs.jimicloud.com/solution/tagsolution.html>):
+
+```
+POST /api/v1/tag/data/push        Content-Type: application/json
+[{"gpsNum":3,"gpsTime":1758722036000,"imei":"...","lat":22.576582,"lng":113.94306,"positionType":"BEACON"}]
+→ {"code":200,"msg":"success"}
+```
+
+```
+Jimi ──push──▶ Caddy (public :80/:443, webhook + /health only) ──▶ middleware ──▶ SQLite outbox ──▶ sender ──IPS──▶ Wialon
+```
+
+- **Jimi does not retry failed pushes**, so the receiver only validates and stores (milliseconds) and answers 200.
+  Delivery to Wialon happens afterwards from the outbox, with all the retry rules below.
+- Records are validated: the IMEI must be digits, there must be a real fix (not `0,0`), and the time must be within the last
+  30 days and no more than 1 day ahead. Invalid records are skipped and logged (`./scripts/pushes.sh`), and the rest of the push is kept.
+- Duplicates (same IMEI and `gpsTime`) are ignored.
+- `gpsTime` is Unix milliseconds (UTC). `positionType` becomes param `pos_type`, and `gpsNum` (accuracy for Tags) becomes param `confidence`.
+- The admin API is **not** exposed publicly. Caddy forwards only the webhook path and `/health`.
+- Optional `WEBHOOK_TOKEN` puts a secret in the URL (`/<token>/api/v1/tag/data/push` or `?token=`), because the spec
+  defines no authentication.
+
+**What to send to Jimi (Delivery Engineer):** the URL from `./scripts/webhook-url.sh`, and **every Jimi account**
+the Tags belong to (sub-account data is not pushed to the parent account).
+
+## Jimi → Wialon bridge (poll mode, `JIMI_MODE=poll`)
 
 ```
             every BRIDGE_POLL_INTERVAL (180 s)
