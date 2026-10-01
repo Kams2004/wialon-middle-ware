@@ -111,7 +111,7 @@ POST /api/v1/tag/data/push        Content-Type: application/json
 ```
 
 ```
-Jimi ──push──▶ Caddy (public :80/:443, webhook + /health only) ──▶ middleware ──▶ SQLite outbox ──▶ sender ──IPS──▶ Wialon
+Jimi ──push──▶ Caddy (public :8090, webhook + /health only) ──▶ middleware ──▶ SQLite outbox ──▶ sender ──IPS──▶ Wialon
 ```
 
 - **Jimi does not retry failed pushes**, so the receiver only validates and stores (milliseconds) and answers 200.
@@ -124,17 +124,11 @@ Jimi ──push──▶ Caddy (public :80/:443, webhook + /health only) ──�
 - Optional `WEBHOOK_TOKEN` puts a secret in the URL (`/<token>/api/v1/tag/data/push` or `?token=`), because the spec
   defines no authentication.
 
-**Public entry point:** choose one.
-
-- **Caddy** (`COMPOSE_PROFILES=proxy`), when ports 80/443 are free.
-- **Existing Apache** on the VPS: leave `COMPOSE_PROFILES` empty, then:
-  ```bash
-  sudo a2enmod proxy proxy_http
-  sudo cp deploy/apache-webhook.conf /etc/apache2/conf-available/wialon-webhook.conf
-  sudo a2enconf wialon-webhook && sudo apache2ctl configtest && sudo systemctl reload apache2
-  ```
-  Only the push path is forwarded, and the existing sites are untouched. It works on the IP and on every domain Apache serves
-  (so `https://<existing-domain>/<token>/api/v1/tag/data/push` gets HTTPS for free).
+**Public entry point:** with `COMPOSE_PROFILES=proxy`, a Caddy container publishes **only** the webhook and
+`/health` on `PROXY_HTTP_PORT` (default **8090**), so the push URL is `http://<server-ip>:8090/<token>/api/v1/tag/data/push`.
+The host's ports 80/443 are never used, and an existing Apache/Nginx is untouched. Open the port in the
+firewall if one is active (`sudo ufw allow 8090/tcp`). As an alternative, an existing Apache can forward the
+path instead (see [deploy/apache-webhook.conf](deploy/apache-webhook.conf)).
 
 **What to send to Jimi (Delivery Engineer):** the URL from `./scripts/webhook-url.sh`, and **every Jimi account**
 the Tags belong to (sub-account data is not pushed to the parent account).
