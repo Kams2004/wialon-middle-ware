@@ -124,6 +124,18 @@ Jimi ──push──▶ Caddy (public :80/:443, webhook + /health only) ──�
 - Optional `WEBHOOK_TOKEN` puts a secret in the URL (`/<token>/api/v1/tag/data/push` or `?token=`), because the spec
   defines no authentication.
 
+**Public entry point:** choose one.
+
+- **Caddy** (`COMPOSE_PROFILES=proxy`), when ports 80/443 are free.
+- **Existing Apache** on the VPS: leave `COMPOSE_PROFILES` empty, then:
+  ```bash
+  sudo a2enmod proxy proxy_http
+  sudo cp deploy/apache-webhook.conf /etc/apache2/conf-available/wialon-webhook.conf
+  sudo a2enconf wialon-webhook && sudo apache2ctl configtest && sudo systemctl reload apache2
+  ```
+  Only the push path is forwarded, and the existing sites are untouched. It works on the IP and on every domain Apache serves
+  (so `https://<existing-domain>/<token>/api/v1/tag/data/push` gets HTTPS for free).
+
 **What to send to Jimi (Delivery Engineer):** the URL from `./scripts/webhook-url.sh`, and **every Jimi account**
 the Tags belong to (sub-account data is not pushed to the parent account).
 
