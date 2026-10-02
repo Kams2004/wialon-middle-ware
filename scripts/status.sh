@@ -5,13 +5,13 @@ $COMPOSE ps
 in_container <<'PY'
 s = get("/bridge/status")
 print()
-if s["mode"] == "webhook":
-    w = s["webhook"]
-    print("mode: webhook | last push from Jimi:", w["last_at"] or "none yet",
-          "| pushes:", w["requests"], "| points new:", w["accepted"],
-          "dup:", w["duplicates"], "invalid:", w["invalid"])
-else:
-    print("mode: poll | last Jimi poll OK:", s["last_poll_ok_at"], "| poll error:", s["last_poll_error"])
+w = s["webhook"]
+print("mode:", s["mode"], "| polling Jimi API:", "ON" if s.get("polling_active") else "off",
+      "| webhook live since:", s.get("webhook_live_since") or "-")
+if s.get("polling_active"):
+    print("last Jimi poll OK:", s["last_poll_ok_at"], "| poll error:", s["last_poll_error"])
+print("last push from Jimi:", w["last_at"] or "none yet", "| pushes:", w["requests"],
+      "| points new:", w["accepted"], "dup:", w["duplicates"], "invalid:", w["invalid"])
 print()
 row = "{:17} {:22} {:14} {:20} {:>6} {:>8} {:>4}"
 print(row.format("IMEI", "NAME", "WIALON UNIT", "LAST GPS (UTC)", "SENT", "PENDING", "REJ"))

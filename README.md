@@ -146,6 +146,16 @@ Push URL: **`https://tagdata.camtrack.net/api/v1/tag/data/push`**
 **What to send to Jimi (Delivery Engineer):** the URL from `./scripts/webhook-url.sh`, and **every Jimi account**
 the Tags belong to (sub-account data is not pushed to the parent account).
 
+## Hybrid mode (`JIMI_MODE=hybrid`): polling until the webhook goes live
+
+Polls the Jimi API exactly like poll mode while the webhook waits on standby. The **first push that contains
+one of our Tags** (an IMEI already known from polling) switches polling off automatically and permanently
+(stored in the database, so it survives restarts). Test pushes with unknown IMEIs do not trigger it.
+Both sources feed the same outbox, and points already received are ignored, so nothing is sent twice.
+
+- `./scripts/status.sh` shows `polling Jimi API: ON/off` and `webhook live since`.
+- To resume polling (e.g. if Jimi stops pushing): `curl -X POST -H "X-API-Key: $API_KEY" localhost:8000/bridge/polling/resume`.
+
 ## Jimi → Wialon bridge (poll mode, `JIMI_MODE=poll`)
 
 ```

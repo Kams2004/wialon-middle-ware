@@ -39,6 +39,8 @@ class Settings(BaseSettings):
     # Jimi / TrackSolid Pro bridge
     #   webhook: Jimi pushes to POST /api/v1/tag/data/push (no Jimi API calls)
     #   poll:    poll the Jimi Open API (needs JIMI_APP_KEY etc.)
+    #   hybrid:  poll, with the webhook on standby; the first push for one of our
+    #            Tags switches polling off automatically
     #   off:     bridge disabled
     jimi_mode: str = "webhook"
     webhook_token: str = ""          # if set, Jimi's URL must carry it (see README)
@@ -56,7 +58,7 @@ class Settings(BaseSettings):
 
     @property
     def bridge_enabled(self) -> bool:
-        return self.jimi_mode in ("webhook", "poll")
+        return self.jimi_mode in ("webhook", "poll", "hybrid")
 
 
 settings = Settings()
@@ -72,9 +74,9 @@ def _build_bridge() -> JimiBridge:
     Path(settings.bridge_db_path).parent.mkdir(parents=True, exist_ok=True)
     store = Store(settings.bridge_db_path)
     jimi = None
-    if settings.jimi_mode == "poll":
+    if settings.jimi_mode in ("poll", "hybrid"):
         if not (settings.jimi_app_key and settings.jimi_account):
-            raise RuntimeError("JIMI_MODE=poll needs JIMI_APP_KEY, JIMI_APP_SECRET, JIMI_ACCOUNT")
+            raise RuntimeError(f"JIMI_MODE={settings.jimi_mode} needs JIMI_APP_KEY, JIMI_APP_SECRET, JIMI_ACCOUNT")
         jimi = JimiClient(
             settings.jimi_app_key, settings.jimi_app_secret, settings.jimi_account,
             settings.jimi_password_md5 or hashlib.md5(settings.jimi_password.encode()).hexdigest(),
@@ -82,7 +84,7 @@ def _build_bridge() -> JimiBridge:
     return JimiBridge(jimi, gateway, store, BridgeConfig(
         poll_interval=settings.bridge_poll_interval,
         backfill_hours=settings.bridge_backfill_hours,
-        overlap_minutes=settings.bridge_overlap_minutes))
+        overlap_minutes=settings.bridge_overlap_minutes), mode=settings.jimi_mode)
 
 
 @asynccontextmanager
@@ -231,16 +233,18 @@ async def jimi_tag_push(request: Request, token: str | None = None):
 async def health():
     ok = True
     info: dict = {"bridge": "disabled"}
-    if bridge and bridge.mode == "webhook":
-        info = {"bridge": "running", "mode": "webhook",
+    if bridge and not bridge.polling_active:
+        info = {"bridge": "running", "mode": bridge.mode, "polling": False,
                 "last_push_at": bridge.webhook["last_at"]}
     elif bridge:
         stale = (bridge.last_poll_ok_at is None or
                  (datetime.now(timezone.utc) - bridge.last_poll_ok_at).total_seconds()
                  > 3 * settings.bridge_poll_interval + 60)
         ok = not (stale and bridge.last_poll_error)
-        info = {"bridge": "running", "mode": "poll", "last_poll_ok_at": bridge.last_poll_ok_at,
-                "last_poll_error": bridge.last_poll_error}
+        info = {"bridge": "running", "mode": bridge.mode, "polling": True,
+                "last_poll_ok_at": bridge.last_poll_ok_at,
+                "last_poll_error": bridge.last_poll_error,
+                "last_push_at": bridge.webhook["last_at"]}
     if not ok:
         raise HTTPException(503, info)
     return {"status": "ok", **info}
@@ -261,10 +265,20 @@ async def bridge_status():
 async def bridge_poll():
     """Poll Jimi now instead of waiting for the next cycle (poll mode only)."""
     b = _require_bridge()
-    if b.mode != "poll":
-        raise HTTPException(409, "bridge is in webhook mode; Jimi pushes data itself")
+    if not b.polling_active:
+        raise HTTPException(409, "polling is off; Jimi pushes data itself")
     b.trigger_poll()
     return {"status": "poll triggered"}
+
+
+@app.post("/bridge/polling/resume")
+async def bridge_polling_resume():
+    """Hybrid mode: switch polling back on after the webhook went live."""
+    b = _require_bridge()
+    if b.mode != "hybrid":
+        raise HTTPException(409, "only available with JIMI_MODE=hybrid")
+    b.reset_webhook_live()
+    return {"status": "polling resumed"}
 
 
 @app.get("/bridge/webhook/recent")

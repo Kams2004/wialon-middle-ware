@@ -6,7 +6,12 @@ Positions enter the SQLite outbox in one of two ways:
           validates them and stores them immediately. Jimi does not retry
           failed pushes, so receiving never waits for Wialon.
 
-  poller  (only when JIMI_MODE=poll) every `poll_interval`: one
+  hybrid  (JIMI_MODE=hybrid) polls like `poll` while the webhook waits on standby;
+          the first push containing one of our Tags (an IMEI already known from
+          polling) switches polling off for good (persisted), so the cut-over to
+          the webhook needs no redeploy.
+
+  poller  (JIMI_MODE=poll or hybrid) every `poll_interval`: one
           jimi.user.device.location.list call for all devices; for each device
           whose latest gpsTime moved past its cursor, fetch jimi.device.track.list
           since (cursor - overlap) so intermediate points are not lost, and
@@ -118,8 +123,10 @@ class BridgeConfig:
 
 class JimiBridge:
     def __init__(self, jimi: JimiClient | None, gateway: IPSGateway, store: Store,
-                 config: BridgeConfig | None = None):
-        """`jimi` is only needed for polling; pass None in webhook mode."""
+                 config: BridgeConfig | None = None, mode: str | None = None):
+        """`jimi` is only needed for polling; pass None in webhook mode.
+        mode: webhook | poll | hybrid (default: poll when `jimi` is given, else webhook)."""
+        self._mode = mode or ("poll" if jimi else "webhook")
         self.jimi, self.gateway, self.store = jimi, gateway, store
         self.cfg = config or BridgeConfig()
         self.devices: dict[str, DeviceState] = {}
@@ -134,10 +141,36 @@ class JimiBridge:
         self.webhook = {"requests": 0, "accepted": 0, "duplicates": 0, "invalid": 0,
                         "last_at": None}
         self.recent_pushes: deque[dict] = deque(maxlen=20)
+        # hybrid: set once Jimi pushes one of our Tags; persisted across restarts
+        self.webhook_live_since: str | None = (store.get_json("webhook_live") or {}).get("since")
 
     @property
     def mode(self) -> str:
-        return "poll" if self.jimi else "webhook"
+        return self._mode
+
+    @property
+    def polling_active(self) -> bool:
+        if self.jimi is None:
+            return False
+        return not (self._mode == "hybrid" and self.webhook_live_since)
+
+    def _maybe_go_live(self, imeis) -> None:
+        """Hybrid: a push for a Tag we already know from polling means Jimi's webhook is live."""
+        if self._mode != "hybrid" or self.webhook_live_since:
+            return
+        known = [i for i in imeis if self.store.cursor(i) is not None]
+        if not known:
+            return
+        self.webhook_live_since = datetime.now(timezone.utc).isoformat()
+        self.store.set_json("webhook_live", {"since": self.webhook_live_since, "first_imei": known[0]})
+        log.warning("Jimi webhook is live (first push for our Tag %s): polling the Jimi API is "
+                    "now switched off", known[0])
+
+    def reset_webhook_live(self) -> None:
+        """Hybrid: resume polling (e.g. if Jimi stopped pushing)."""
+        self.webhook_live_since = None
+        self.store.set_json("webhook_live", {})
+        self._poll_now.set()
 
     def _state(self, imei: str) -> DeviceState:
         return self.devices.setdefault(imei, DeviceState(imei))
@@ -189,6 +222,7 @@ class JimiBridge:
             log.warning("webhook: %d invalid record(s), e.g. %s", len(invalid), invalid[:3])
         log.info("webhook: %d received, %d new, %d duplicate, %d invalid",
                  result["received"], accepted, result["duplicates"], len(invalid))
+        self._maybe_go_live(by_imei)
         if accepted:
             self._wake.set()
         return result
@@ -265,7 +299,19 @@ class JimiBridge:
         return new
 
     async def _poll_loop(self) -> None:
+        announced = False
         while True:
+            if not self.polling_active:
+                if not announced:
+                    log.info("polling on standby: data now arrives by webhook")
+                    announced = True
+                self._poll_now.clear()
+                try:
+                    await asyncio.wait_for(self._poll_now.wait(), self.cfg.poll_interval)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+            announced = False
             try:
                 await self.poll_once()
                 self._poll_failures = 0
@@ -376,6 +422,8 @@ class JimiBridge:
         imeis = sorted(set(self.devices) | set(counts))
         return {
             "mode": self.mode,
+            "polling_active": self.polling_active,
+            "webhook_live_since": self.webhook_live_since,
             "webhook": self.webhook,
             "last_poll_at": self.last_poll_at,
             "last_poll_ok_at": self.last_poll_ok_at,
