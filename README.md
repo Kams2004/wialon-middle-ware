@@ -111,7 +111,7 @@ POST /api/v1/tag/data/push        Content-Type: application/json
 ```
 
 ```
-Jimi ──push──▶ Caddy (public HTTPS :8443, webhook + /health only) ──▶ middleware ──▶ SQLite outbox ──▶ sender ──IPS──▶ Wialon
+Jimi ──push──▶ Apache (https://tagdata.camtrack.net, webhook + /health only) ──▶ middleware ──▶ SQLite outbox ──▶ sender ──IPS──▶ Wialon
 ```
 
 - **Jimi does not retry failed pushes**, so the receiver only validates and stores (milliseconds) and answers 200.
@@ -121,18 +121,27 @@ Jimi ──push──▶ Caddy (public HTTPS :8443, webhook + /health only) ─�
 - Duplicates (same IMEI and `gpsTime`) are ignored.
 - `gpsTime` is Unix milliseconds (UTC). `positionType` becomes param `pos_type`, and `gpsNum` (accuracy for Tags) becomes param `confidence`.
 - The admin API is **not** exposed publicly. Caddy forwards only the webhook path and `/health`.
-- Optional `WEBHOOK_TOKEN` puts a secret in the URL (`/<token>/api/v1/tag/data/push` or `?token=`), because the spec
-  defines no authentication.
+- Jimi's spec defines no authentication. HTTPS protects the data in transit but does not identify the sender.
+  `WEBHOOK_TOKEN` (empty by default) can add a secret to the URL if ever needed.
 
-**Public entry point:** with `COMPOSE_PROFILES=proxy`, a Caddy container publishes **only** the webhook and
-`/health` on **one** port (`PROXY_PORT`). The host's ports 80/443 are never used, so an existing Apache/Nginx is untouched.
+**Public entry point (Apache on the VPS):** the host's Apache serves `https://tagdata.camtrack.net` on 443 with its
+own virtual host ([deploy/apache/tagdata.camtrack.net.conf](deploy/apache/tagdata.camtrack.net.conf)). It forwards only
+`/api/v1/tag/data/push` and `/health` to `127.0.0.1:8000` and refuses everything else. No ports change, and other sites are untouched.
 
-- `CADDY_CONFIG=https` (recommended): HTTPS on `PROXY_PORT` (e.g. 8443), using a certificate certbot already
-  maintains in `/etc/letsencrypt/live/<WEBHOOK_DOMAIN>/` (mounted read-only). Get one once with
-  `sudo certbot certonly --apache -d <WEBHOOK_DOMAIN>`. This only obtains the certificate and doesn't change the Apache config.
-  Then run `./scripts/enable-cert-reload.sh` so a renewed certificate is picked up weekly (`caddy reload`, no downtime).
-  URL: `https://<WEBHOOK_DOMAIN>:<PROXY_PORT>/<token>/api/v1/tag/data/push`.
-- `CADDY_CONFIG=http`: plain HTTP on `PROXY_PORT`.
+```bash
+sudo certbot certonly --apache -d tagdata.camtrack.net          # once: certificate
+sudo a2enmod proxy proxy_http ssl
+sudo cp deploy/apache/tagdata.camtrack.net.conf /etc/apache2/sites-available/
+sudo a2ensite tagdata.camtrack.net && sudo apache2ctl configtest && sudo systemctl reload apache2
+# reload Apache after each certificate renewal
+sudo cp deploy/apache/certbot-reload-apache.sh /etc/letsencrypt/renewal-hooks/deploy/reload-apache.sh
+sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-apache.sh
+```
+
+Push URL: **`https://tagdata.camtrack.net/api/v1/tag/data/push`**
+
+*Alternative without Apache:* `COMPOSE_PROFILES=proxy` starts a Caddy container on its own `PROXY_PORT`
+(`CADDY_CONFIG=https` reuses a certbot certificate; `./scripts/enable-cert-reload.sh` reloads it weekly).
 
 **What to send to Jimi (Delivery Engineer):** the URL from `./scripts/webhook-url.sh`, and **every Jimi account**
 the Tags belong to (sub-account data is not pushed to the parent account).
