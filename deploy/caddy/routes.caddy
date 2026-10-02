@@ -1,0 +1,18 @@
+# Shared routes: only the Jimi webhook and /health are public; everything else is 404.
+@webhook path_regexp ^/([A-Za-z0-9_-]+/)?api/v1/tag/data/push/?$
+handle @webhook {
+	request_body {
+		max_size 2MB
+	}
+	reverse_proxy middleware:8000
+}
+handle /health {
+	reverse_proxy middleware:8000
+}
+handle {
+	respond 404
+}
+log {
+	output stdout
+	format console
+}

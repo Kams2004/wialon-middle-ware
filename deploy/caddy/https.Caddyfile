@@ -1,0 +1,12 @@
+# HTTPS on PROXY_PORT with an EXISTING Let's Encrypt certificate (CADDY_CONFIG=https).
+# The certificate is the one certbot already maintains for Apache; it is mounted
+# read-only and never modified. Ports 80/443 of the host are not used.
+# After certbot renews it, `scripts/reload-proxy.sh` (weekly cron) loads the new files.
+{
+	auto_https disable_redirects
+}
+
+{$WEBHOOK_DOMAIN}:{$PROXY_PORT} {
+	tls /certs/live/{$CERT_NAME}/fullchain.pem /certs/live/{$CERT_NAME}/privkey.pem
+	import routes.caddy
+}

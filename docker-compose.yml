@@ -24,7 +24,8 @@ services:
         max-size: "10m"
         max-file: "5"
 
-  # public reverse proxy for the Jimi webhook; enable with COMPOSE_PROFILES=proxy in .env
+  # public reverse proxy for the Jimi webhook; enable with COMPOSE_PROFILES=proxy in .env.
+  # It publishes ONE port (PROXY_PORT) and never uses the host's 80/443.
   proxy:
     image: caddy:2-alpine
     container_name: wialon-proxy
@@ -33,13 +34,16 @@ services:
     depends_on:
       middleware:
         condition: service_healthy
+    command: ["caddy", "run", "--config", "/etc/caddy/${CADDY_CONFIG:-http}.Caddyfile", "--adapter", "caddyfile"]
     environment:
-      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+      PROXY_PORT: ${PROXY_PORT:-8090}
+      WEBHOOK_DOMAIN: ${WEBHOOK_DOMAIN:-}
+      CERT_NAME: ${CERT_NAME:-${WEBHOOK_DOMAIN:-}}
     ports:
-      # one dedicated public port; ports 80/443 of the host are never used
-      - "${PROXY_HTTP_PORT:-8090}:80"
+      - "${PROXY_PORT:-8090}:${PROXY_PORT:-8090}"
     volumes:
-      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./deploy/caddy:/etc/caddy:ro
+      - ${LETSENCRYPT_DIR:-/etc/letsencrypt}:/certs:ro
       - caddy-data:/data
       - caddy-config:/config
     logging:

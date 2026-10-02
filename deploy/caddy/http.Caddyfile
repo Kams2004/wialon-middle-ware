@@ -1,0 +1,4 @@
+# Plain HTTP on PROXY_PORT (CADDY_CONFIG=http).
+:{$PROXY_PORT} {
+	import routes.caddy
+}

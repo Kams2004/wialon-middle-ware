@@ -111,7 +111,7 @@ POST /api/v1/tag/data/push        Content-Type: application/json
 ```
 
 ```
-Jimi ──push──▶ Caddy (public :8090, webhook + /health only) ──▶ middleware ──▶ SQLite outbox ──▶ sender ──IPS──▶ Wialon
+Jimi ──push──▶ Caddy (public HTTPS :8443, webhook + /health only) ──▶ middleware ──▶ SQLite outbox ──▶ sender ──IPS──▶ Wialon
 ```
 
 - **Jimi does not retry failed pushes**, so the receiver only validates and stores (milliseconds) and answers 200.
@@ -125,10 +125,14 @@ Jimi ──push──▶ Caddy (public :8090, webhook + /health only) ──▶ 
   defines no authentication.
 
 **Public entry point:** with `COMPOSE_PROFILES=proxy`, a Caddy container publishes **only** the webhook and
-`/health` on `PROXY_HTTP_PORT` (default **8090**), so the push URL is `http://<server-ip>:8090/<token>/api/v1/tag/data/push`.
-The host's ports 80/443 are never used, and an existing Apache/Nginx is untouched. Open the port in the
-firewall if one is active (`sudo ufw allow 8090/tcp`). As an alternative, an existing Apache can forward the
-path instead (see [deploy/apache-webhook.conf](deploy/apache-webhook.conf)).
+`/health` on **one** port (`PROXY_PORT`). The host's ports 80/443 are never used, so an existing Apache/Nginx is untouched.
+
+- `CADDY_CONFIG=https` (recommended): HTTPS on `PROXY_PORT` (e.g. 8443), using a certificate certbot already
+  maintains in `/etc/letsencrypt/live/<WEBHOOK_DOMAIN>/` (mounted read-only). Get one once with
+  `sudo certbot certonly --apache -d <WEBHOOK_DOMAIN>`. This only obtains the certificate and doesn't change the Apache config.
+  Then run `./scripts/enable-cert-reload.sh` so a renewed certificate is picked up weekly (`caddy reload`, no downtime).
+  URL: `https://<WEBHOOK_DOMAIN>:<PROXY_PORT>/<token>/api/v1/tag/data/push`.
+- `CADDY_CONFIG=http`: plain HTTP on `PROXY_PORT`.
 
 **What to send to Jimi (Delivery Engineer):** the URL from `./scripts/webhook-url.sh`, and **every Jimi account**
 the Tags belong to (sub-account data is not pushed to the parent account).
