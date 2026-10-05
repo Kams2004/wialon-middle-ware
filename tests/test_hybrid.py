@@ -65,3 +65,18 @@ def test_poll_and_webhook_modes_are_unchanged(tmp_path):
     assert poll.polling_active                             # only hybrid switches itself off
     hook = JimiBridge(None, gw, store)
     assert hook.mode == "webhook" and not hook.polling_active
+
+
+def test_polled_tags_are_allowed_and_cursors_seed_the_allowlist(tmp_path):
+    async def run():
+        fake = FakeJimi()
+        fake.locations = [{"imei": TAG, "lat": 4.02, "lng": 9.70, "gpsTime": ts(5)}]
+        store = Store(str(tmp_path / "db"))
+        bridge = JimiBridge(make_jimi(fake), IPSGateway("127.0.0.1", 1, ping_interval=0), store)
+        assert not store.is_allowed(TAG)
+        await bridge.poll_once()
+        assert store.is_allowed(TAG)
+        # an existing database (cursors from earlier polling) seeds the list on open
+        store.db.execute("DELETE FROM allowed_imeis")
+        assert Store(str(tmp_path / "db")).is_allowed(TAG)
+    asyncio.run(run())

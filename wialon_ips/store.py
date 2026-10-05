@@ -34,6 +34,11 @@ CREATE TABLE IF NOT EXISTS cursors (
     imei       TEXT PRIMARY KEY,
     last_time  INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS allowed_imeis (
+    imei      TEXT PRIMARY KEY,
+    source    TEXT NOT NULL,
+    added_at  INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS kv (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -59,6 +64,9 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.executescript(SCHEMA)
+        # every IMEI ever seen through the Jimi API (cursors) is one of our Tags
+        self.db.execute("INSERT OR IGNORE INTO allowed_imeis(imei, source, added_at) "
+                        "SELECT imei, 'jimi', ? FROM cursors", (int(time.time()),))
 
     def close(self) -> None:
         self.db.close()
@@ -85,6 +93,29 @@ class Store:
                         "ON CONFLICT(imei) DO UPDATE SET last_time=max(last_time, excluded.last_time)",
                         (imei, int(t.timestamp())))
 
+    # ---------- allowlist ----------
+    # Wialon IPS logs in by unique ID across the whole Wialon hosting, so an IMEI that
+    # is not ours could land in another customer's unit. Only allowed IMEIs are sent.
+
+    def allow(self, imeis, source: str) -> int:
+        before = self.db.total_changes
+        now = int(time.time())
+        with self.db:
+            self.db.executemany("INSERT OR IGNORE INTO allowed_imeis(imei, source, added_at) "
+                                "VALUES(?, ?, ?)", [(i, source, now) for i in imeis])
+        return self.db.total_changes - before
+
+    def disallow(self, imei: str) -> bool:
+        return self.db.execute("DELETE FROM allowed_imeis WHERE imei=?", (imei,)).rowcount > 0
+
+    def is_allowed(self, imei: str) -> bool:
+        return self.db.execute("SELECT 1 FROM allowed_imeis WHERE imei=?", (imei,)).fetchone() is not None
+
+    def allowed(self) -> list[dict]:
+        return [{"imei": i, "source": s, "added_at": datetime.fromtimestamp(t, timezone.utc).isoformat()}
+                for i, s, t in self.db.execute(
+                    "SELECT imei, source, added_at FROM allowed_imeis ORDER BY imei")]
+
     # ---------- messages ----------
 
     def enqueue(self, imei: str, positions: list[Position]) -> int:
@@ -97,9 +128,11 @@ class Store:
                 [(imei, int(p.time.timestamp()), _encode(p), now) for p in positions])
             return self.db.total_changes - before
 
-    def imeis_with_pending(self) -> list[str]:
-        return [r[0] for r in self.db.execute(
-            "SELECT DISTINCT imei FROM messages WHERE status=?", (PENDING,))]
+    def imeis_with_pending(self, allowed_only: bool = False) -> list[str]:
+        sql = "SELECT DISTINCT imei FROM messages WHERE status=?"
+        if allowed_only:
+            sql += " AND imei IN (SELECT imei FROM allowed_imeis)"
+        return [r[0] for r in self.db.execute(sql, (PENDING,))]
 
     def pending(self, imei: str, limit: int) -> list[tuple[int, Position]]:
         rows = self.db.execute(

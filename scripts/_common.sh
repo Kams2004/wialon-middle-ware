@@ -11,7 +11,7 @@ else
 fi
 
 # run the python program given on stdin inside the container (no python needed on the host);
-# it gets get(path, method) for calling the API with the configured key
+# it gets get(path, method) for calling the API with the configured key, and $ARG as env ARG
 in_container() {
   { cat <<'PY'
 import json, os, urllib.request
@@ -21,5 +21,5 @@ def get(path, method="GET"):
     with urllib.request.urlopen(req, timeout=15) as r:
         return json.load(r)
 PY
-    cat; } | $COMPOSE exec -T middleware python -
+    cat; } | $COMPOSE exec -T -e ARG="${ARG:-}" middleware python -
 }

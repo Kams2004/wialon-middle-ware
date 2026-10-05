@@ -146,6 +146,19 @@ Push URL: **`https://tagdata.camtrack.net/api/v1/tag/data/push`**
 **What to send to Jimi (Delivery Engineer):** the URL from `./scripts/webhook-url.sh`, and **every Jimi account**
 the Tags belong to (sub-account data is not pushed to the parent account).
 
+## IMEI allowlist (only our Tags reach Wialon)
+
+Wialon IPS logs a device in by its unique ID across the **whole Wialon hosting**, not per account, so an IMEI
+that is not ours (a test IMEI, Jimi's "Verify" sample) can land in **another customer's unit**. The sender
+therefore only delivers IMEIs on the allowlist:
+
+- Every Tag seen in the Jimi account through polling is added automatically (`source: jimi`).
+- `ALLOWED_IMEIS=` in `.env` (comma separated) adds more at startup (`source: config`).
+- `./scripts/allow-imei.sh` lists them, `./scripts/allow-imei.sh <IMEI>` adds one (its kept positions are then
+  sent), and `./scripts/allow-imei.sh --remove <IMEI>` removes one.
+- Pushes for other IMEIs are still answered `success` and kept (status `not_allowed`), but never sent.
+  They expire after 30 days.
+
 ## Hybrid mode (`JIMI_MODE=hybrid`): polling until the webhook goes live
 
 Polls the Jimi API exactly like poll mode while the webhook waits on standby. The **first push that contains

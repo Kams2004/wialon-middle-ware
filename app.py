@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     jimi_mode: str = "webhook"
     webhook_token: str = ""          # if set, Jimi's URL must carry it (see README)
     webhook_max_body: int = 2_000_000
+    allowed_imeis: str = ""          # extra IMEIs allowed to be sent to Wialon (comma separated)
     jimi_base_url: str = "https://eu-open.tracksolidpro.com/route/rest"
     jimi_app_key: str = ""
     jimi_app_secret: str = ""
@@ -74,6 +75,9 @@ bridge: JimiBridge | None = None
 def _build_bridge() -> JimiBridge:
     Path(settings.bridge_db_path).parent.mkdir(parents=True, exist_ok=True)
     store = Store(settings.bridge_db_path)
+    extra = [i.strip() for i in settings.allowed_imeis.split(",") if i.strip()]
+    if extra:
+        store.allow(extra, "config")
     jimi = None
     if settings.jimi_mode in ("poll", "hybrid"):
         if not (settings.jimi_app_key and settings.jimi_account):
@@ -299,6 +303,26 @@ async def bridge_poll():
         raise HTTPException(409, "polling is off; Jimi pushes data itself")
     b.trigger_poll()
     return {"status": "poll triggered"}
+
+
+@app.get("/bridge/allowed")
+async def bridge_allowed():
+    """IMEIs whose positions may be sent to Wialon."""
+    return _require_bridge().store.allowed()
+
+
+@app.post("/bridge/allowed/{imei}")
+async def bridge_allow(imei: str):
+    if not (imei.isdigit() and 5 <= len(imei) <= 20):
+        raise HTTPException(422, "IMEI must be 5-20 digits")
+    added = _require_bridge().allow_imei(imei)
+    return {"imei": imei, "status": "added" if added else "already allowed"}
+
+
+@app.delete("/bridge/allowed/{imei}")
+async def bridge_disallow(imei: str):
+    removed = _require_bridge().store.disallow(imei)
+    return {"imei": imei, "status": "removed" if removed else "was not allowed"}
 
 
 @app.post("/bridge/polling/resume")

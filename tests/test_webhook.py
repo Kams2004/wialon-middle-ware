@@ -109,11 +109,21 @@ def test_pushed_points_are_delivered_to_wialon(tmp_path):
         port = server.sockets[0].getsockname()[1]
         store = Store(str(tmp_path / "db"))
         gw = IPSGateway("127.0.0.1", port, ping_interval=0, timeout=2)
+        wialon.known.add("123456789012345")                   # someone else's unit on the hosting
         bridge = JimiBridge(None, gw, store)
-        bridge.ingest([point(9), point(6), point(3), point(5, imei="111111111111111")])
+        bridge.ingest([point(9), point(6), point(3), point(5, imei="123456789012345")])
+
+        # nothing is sent for IMEIs that are not ours, even if Wialon would accept them
+        await bridge.send_pending()
+        assert store.stats() == {IMEI: {PENDING: 3}, "123456789012345": {PENDING: 1}}
+        assert wialon.log == []
+        assert bridge.status()["devices"][0]["wialon_unit"] == "not_allowed"
+
+        bridge.allow_imei(IMEI)                               # one of our Tags
         await bridge.send_pending()
         assert store.stats()[IMEI] == {SENT: 3}
-        assert store.stats()["111111111111111"] == {PENDING: 1}    # no unit yet: kept
+        assert store.stats()["123456789012345"] == {PENDING: 1}    # still held
         assert (IMEI, "B") in wialon.log
+        assert all(i == IMEI for i, _ in wialon.log)
         await gw.stop(); server.close()
     asyncio.run(run())

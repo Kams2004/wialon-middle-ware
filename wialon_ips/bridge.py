@@ -141,6 +141,7 @@ class JimiBridge:
         self.webhook = {"requests": 0, "accepted": 0, "duplicates": 0, "invalid": 0,
                         "last_at": None}
         self.recent_pushes: deque[dict] = deque(maxlen=20)
+        self._warned_unknown: set[str] = set()
         # hybrid: set once Jimi pushes one of our Tags; persisted across restarts
         self.webhook_live_since: str | None = (store.get_json("webhook_live") or {}).get("since")
 
@@ -165,6 +166,12 @@ class JimiBridge:
         self.store.set_json("webhook_live", {"since": self.webhook_live_since, "first_imei": known[0]})
         log.warning("Jimi webhook is live (first push for our Tag %s): polling the Jimi API is "
                     "now switched off", known[0])
+
+    def allow_imei(self, imei: str, source: str = "manual") -> bool:
+        added = self.store.allow([imei], source) > 0
+        self._warned_unknown.discard(imei)
+        self._wake.set()
+        return added
 
     def reset_webhook_live(self) -> None:
         """Hybrid: resume polling (e.g. if Jimi stopped pushing)."""
@@ -202,6 +209,11 @@ class JimiBridge:
 
         accepted = 0
         for imei, positions in by_imei.items():
+            if not self.store.is_allowed(imei) and imei not in self._warned_unknown:
+                self._warned_unknown.add(imei)
+                log.warning("push for IMEI %s, which is not on the allowlist: kept but NOT sent "
+                            "to Wialon (add it with scripts/allow-imei.sh if it is one of our Tags)",
+                            imei)
             accepted += self.store.enqueue(imei, positions)
             st = self._state(imei)
             st.last_received_at = now
@@ -248,6 +260,9 @@ class JimiBridge:
         """One polling cycle. Returns the number of new messages queued."""
         self.last_poll_at = datetime.now(timezone.utc)
         locations = await self.jimi.latest_locations()
+        new_tags = self.store.allow([l["imei"] for l in locations if l.get("imei")], "jimi")
+        if new_tags:
+            log.info("%d Tag(s) from the Jimi account added to the allowlist", new_tags)
         queued = 0
         for loc in locations:
             imei = loc.get("imei")
@@ -393,7 +408,7 @@ class JimiBridge:
 
     async def send_pending(self) -> None:
         now = time.monotonic()
-        due = [imei for imei in self.store.imeis_with_pending()
+        due = [imei for imei in self.store.imeis_with_pending(allowed_only=True)
                if self._state(imei).next_attempt <= now]
         results = await asyncio.gather(*(self.drain(i) for i in due), return_exceptions=True)
         for imei, r in zip(due, results):
@@ -441,7 +456,7 @@ class JimiBridge:
             "devices": [{
                 "imei": i,
                 "name": self._state(i).name,
-                "wialon_unit": self._state(i).unit,
+                "wialon_unit": self._state(i).unit if self.store.is_allowed(i) else "not_allowed",
                 "last_gps_time": self._state(i).last_gps_time,
                 "last_received_at": self._state(i).last_received_at,
                 "last_sent_at": self._state(i).last_sent_at,
