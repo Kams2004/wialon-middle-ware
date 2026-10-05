@@ -11,6 +11,7 @@ import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import parse_qs
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -186,18 +187,49 @@ def _records(payload) -> list | None:
     if isinstance(payload, list):
         return payload
     if isinstance(payload, dict):
-        for key in ("data", "list", "records"):
-            if isinstance(payload.get(key), list):
-                return payload[key]
+        for key in ("data", "list", "records", "data_list"):
+            value = payload.get(key)
+            if isinstance(value, str):          # form-style: data='[...]'
+                try:
+                    value = json.loads(value)
+                except ValueError:
+                    continue
+            if isinstance(value, list):
+                return value
         if "imei" in payload:
             return [payload]
     return None
 
 
+def _parse_body(body: bytes, content_type: str):
+    """JSON body, or a form body whose fields may hold JSON."""
+    try:
+        return json.loads(body)
+    except ValueError:
+        pass
+    if "form" in content_type:
+        form = {k: v[0] for k, v in parse_qs(body.decode(errors="replace")).items()}
+        return form or None
+    return None
+
+
+@app.get(WEBHOOK_PATH)
+@app.head(WEBHOOK_PATH)
+async def jimi_tag_push_check():
+    """Jimi's "Verify" button may probe the URL with GET/HEAD: answer like a successful push."""
+    logging.getLogger("webhook").info("webhook URL checked (GET/HEAD)")
+    return _webhook_reply(200, "success")
+
+
 @app.post(WEBHOOK_PATH)
 @app.post("/{token}" + WEBHOOK_PATH)
 async def jimi_tag_push(request: Request, token: str | None = None):
-    """Receiver for Jimi's Tag location push. Stores and answers at once (Jimi does not retry)."""
+    """Receiver for Jimi's Tag location push. Stores and answers at once (Jimi does not retry).
+
+    Anything that is not a list of positions (an empty "Verify" request, a sample in
+    another shape) is answered with success too, so Jimi's verification passes, and
+    recorded in /bridge/webhook/recent so its real format can be inspected.
+    """
     log = logging.getLogger("webhook")
     if not bridge:
         return _webhook_reply(503, "bridge disabled")
@@ -211,14 +243,12 @@ async def jimi_tag_push(request: Request, token: str | None = None):
     if len(body) > settings.webhook_max_body:
         log.error("push of %d bytes refused (limit %d)", len(body), settings.webhook_max_body)
         return _webhook_reply(413, "payload too large")
-    try:
-        records = _records(json.loads(body))
-    except ValueError:
-        records = None
+    sender = request.client.host if request.client else "?"
+    records = _records(_parse_body(body, request.headers.get("content-type", "")))
     if records is None:
-        log.error("unreadable push from %s: %r", request.client.host if request.client else "?",
-                  body[:500])
-        return _webhook_reply(400, "invalid payload")
+        log.warning("push without positions from %s (verification?): %r", sender, body[:500])
+        bridge.note_unrecognized(sender, request.headers.get("content-type", ""), body)
+        return _webhook_reply(200, "success")
     try:
         bridge.ingest(records)
     except Exception:

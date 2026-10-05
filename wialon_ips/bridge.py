@@ -227,6 +227,16 @@ class JimiBridge:
             self._wake.set()
         return result
 
+    def note_unrecognized(self, sender: str, content_type: str, body: bytes) -> None:
+        """Record a push that held no positions (e.g. Jimi's "Verify"), for inspection."""
+        self.webhook["requests"] += 1
+        self.webhook["last_at"] = datetime.now(timezone.utc)
+        self.recent_pushes.appendleft({
+            "at": self.webhook["last_at"], "received": 0, "accepted": 0, "duplicates": 0,
+            "invalid": 0, "imeis": [], "errors": [],
+            "unrecognized": {"from": sender, "content_type": content_type,
+                             "body": body[:1000].decode(errors="replace")}})
+
     def housekeeping(self) -> None:
         if time.time() - self._last_prune > 86400:
             self.store.prune(self.cfg.keep_sent_days, self.cfg.max_pending_days)

@@ -65,10 +65,25 @@ def test_wrapped_and_single_object_payloads(client):
     assert app_module.bridge.store.stats()[IMEI] == {PENDING: 2}
 
 
-def test_unreadable_payload_is_refused(client):
-    r = client.post(URL, content=b"not json", headers={"content-type": "application/json"})
-    assert r.status_code == 400 and r.json()["code"] == 400
-    assert client.post(URL, json={"hello": 1}).status_code == 400
+def test_verification_requests_get_success_and_are_recorded(client):
+    # Jimi's "Verify" button: unknown shape, so every variant must answer success
+    assert client.get(URL).json() == {"code": 200, "msg": "success"}
+    assert client.head(URL).status_code == 200
+    r = client.post(URL, content=b"", headers={"content-type": "application/json"})
+    assert r.status_code == 200 and r.json()["code"] == 200
+    assert client.post(URL, content=b"not json").json()["code"] == 200
+    assert client.post(URL, json={"hello": 1}).json()["code"] == 200
+    assert client.post(URL, json=[]).json()["code"] == 200
+    last = app_module.bridge.recent_pushes[1]           # {"hello": 1}
+    assert last["unrecognized"]["body"] == '{"hello":1}'
+    assert app_module.bridge.store.stats() == {}        # nothing stored
+
+
+def test_form_encoded_push_with_json_field(client):
+    body = "data=" + json.dumps([point(3)])
+    r = client.post(URL, content=body.encode(), headers={"content-type": "application/x-www-form-urlencoded"})
+    assert r.json()["code"] == 200
+    assert app_module.bridge.store.stats()[IMEI] == {PENDING: 1}
 
 
 def test_webhook_token_in_query_or_path(client, monkeypatch):
